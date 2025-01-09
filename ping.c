@@ -31,7 +31,7 @@ struct packet {
     char msg[PACKETSIZE - sizeof(struct icmphdr)];
 };
 
-
+//--------------------------------------------------------------------------------------------
 /**
  * Method Goal:
  *      Represents shared data used for statistics across multiple processes.
@@ -44,6 +44,7 @@ struct shared_data {
     double total_time;
     struct timeval send_times[MAX_PACKETS];
 };
+//--------------------------------------------------------------------------------------------
 // Defining global variables
 volatile sig_atomic_t keep_running = 1;
 struct shared_data *shared = NULL;
@@ -54,7 +55,7 @@ int ttl = 56;
 int sleepTime = 1;
 int ip_v = 4;
 struct protoent *proto = NULL;
-
+//--------------------------------------------------------------------------------------------
 /**
  * @brief Handles termination signals (e.g., SIGINT or SIGTERM).
  * @param signum Signal number
@@ -63,6 +64,7 @@ void signal_handler(int signum) {
     keep_running = 0;
 }
 
+//--------------------------------------------------------------------------------------------
 /**
  * Method Goals:
 *      Creates and initializes shared memory for storing statistics.
@@ -78,6 +80,8 @@ struct shared_data* shared_mem() {
     memset(ptr, 0, sizeof(struct shared_data));
     return (struct shared_data*)ptr;
 }
+
+//--------------------------------------------------------------------------------------------
 /**
  * Method Goals:
  *      receives a poointer to the packet and the length and computes the checksum for an ICMP packet.
@@ -98,6 +102,8 @@ unsigned short checksum(void *b, int len) {
     result = ~sum;
     return result;
 }
+
+//--------------------------------------------------------------------------------------------
 /**
  * Method Goals:
  *         receives a pointer to the buffer that contains the packet and also receives number of bytes in the packet
@@ -128,6 +134,8 @@ void displayipv4(void *buf, int bytes) {
     }
     printf("-------------------\n");
 }
+
+//--------------------------------------------------------------------------------------------
 /**
  * Method Goals:
  *         receives a pointer to the buffer that contains the packet and also receives number of bytes in the packet
@@ -161,6 +169,8 @@ void displayipv6(void *buf, int bytes) {
     }
     printf("-------------------\n");
 }
+
+//--------------------------------------------------------------------------------------------
 /**
  * Methods Goal:
  *          receives a pointer to the buffer where the packet is located, 
@@ -176,6 +186,8 @@ void display(void *buf, int bytes) {
         printf("Unknown IP version\n");
     }
 }
+
+//--------------------------------------------------------------------------------------------
 /**
  * Methods Goal:
  *      receives a pointer to the buffer containing the packet 
@@ -214,6 +226,8 @@ void process(void *buf, int bytes) {
         }
     }
 }
+
+//--------------------------------------------------------------------------------------------
 /**
  * Methods Goal:
  *          Listens for ICMP Echo Reply packets and processes them.
@@ -246,6 +260,8 @@ void listener(void) {
     close(sd);
     exit(0);
 }
+
+//--------------------------------------------------------------------------------------------
 /**
  * Methods Goal:
  *          receives a pointer to the destenantion address
@@ -300,7 +316,7 @@ void ping(struct sockaddr_in *addr) {
     close(sd);
 }
 
-
+//--------------------------------------------------------------------------------------------
 /**
  * Methods Goal: 
  *          receives argc and argv command lind arguments 
