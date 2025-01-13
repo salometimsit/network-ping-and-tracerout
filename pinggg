@@ -23,9 +23,11 @@
 #define MAX_RETRY 3
 
 // Function prototypes
+struct sockaddr_in destination_address;
 unsigned short calculate_checksum(void *b, int len);
 void display_results(float *result, char *addr);
 double calculate_std(float *arr, int size, float mean);
+
 
 // Global variables
 int sending_pings = 0;
@@ -34,7 +36,7 @@ int rtt_count = 0;
 float *rtts = NULL;
 
 int main(int argc, char *argv[]) {
-    if (argc < 5) {
+    if (argc != 2) {
         fprintf(stderr, "Usage: %s -a <address> -t <type> [-c <count>] [-f]\n", argv[0]);
         return 1;
     }
@@ -44,6 +46,11 @@ int main(int argc, char *argv[]) {
     int ip_v = 0;              // IP version (4 for IPv4, 6 for IPv6)
     char *address = NULL;      // Target address
     int opt;
+    char buffer[BUFFER_SIZE] = {0};
+    char *msg = "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$^&*()_+{}|:<>?~`-=[]',.";
+    int payload_size = strlen(msg) + 1;
+    int retries = 0;
+    int seq = 0;
 
     // Parse command-line arguments
     while ((opt = getopt(argc, argv, "a:t:c:f")) != -1) {
@@ -86,8 +93,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Set up destination address
-    struct sockaddr_storage destination_address;
+   
     memset(&destination_address, 0, sizeof(destination_address));
 
     if (ip_v == 4) {
@@ -105,9 +111,14 @@ int main(int argc, char *argv[]) {
     }
 
     // Create socket
-    int sock = (ip_v == 4) ?
-               socket(AF_INET, SOCK_RAW, IPPROTO_ICMP) :
-               socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+    int sock=0;
+    if (ip_v==4){
+        sock= socket(AF_INET, SOCK_RAW, IPPROTO_ICMP) ;
+    }
+    if(ip_v==6){
+        sock=  socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+
+    }
 
     if (sock < 0) {
         perror("socket");
@@ -116,11 +127,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    char buffer[BUFFER_SIZE] = {0};
-    char *msg = "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$^&*()_+{}|:<>?~`-=[]',.";
-    int payload_size = strlen(msg) + 1;
-    int retries = 0;
-    int seq = 0;
+    
 
     struct pollfd fds[1];
     fds[0].fd = sock;
@@ -143,7 +150,8 @@ int main(int argc, char *argv[]) {
             memcpy(buffer, &icmp_header, sizeof(icmp_header));
             memcpy(buffer + sizeof(icmp_header), msg, payload_size);
             ((struct icmphdr *)buffer)->checksum = calculate_checksum(buffer, sizeof(icmp_header) + payload_size);
-        } else {
+        } 
+        else {
             struct icmp6_hdr icmp6_header;
             icmp6_header.icmp6_type = ICMP6_ECHO_REQUEST;
             icmp6_header.icmp6_code = 0;
@@ -165,7 +173,8 @@ int main(int argc, char *argv[]) {
                 close(sock);
                 return 1;
             }
-        } else {
+        } 
+        else {
             if (sendto(sock, buffer, sizeof(struct icmp6_hdr) + payload_size, 0, 
                        (struct sockaddr *)&destination_address, sizeof(struct sockaddr_in6)) <= 0) {
                 perror("sendto");
@@ -177,9 +186,17 @@ int main(int argc, char *argv[]) {
 
         int ret = poll(fds, 1, TIMEOUT);
         if (ret == 0) {
-            fprintf(stderr, "Request timeout for icmp_seq %d\n", seq);
-            continue;
-        } else if (ret < 0) {
+            if (++retries == MAX_RETRY)
+			{
+				fprintf(stderr, "Request timeout for icmp_seq %d, aborting.\n", seq);
+				break;
+			}
+            fprintf(stderr, "Request timeout for icmp_seq %d, retrying...\n", seq);
+			--seq; // Decrement the sequence number to send the same request again.
+			continue;
+        }
+        
+    else if (ret < 0) {
             perror("poll");
             close(sock);
             return 1;
@@ -189,6 +206,8 @@ int main(int argc, char *argv[]) {
             struct sockaddr_storage source_address;
             socklen_t addr_len = sizeof(source_address);
             memset(buffer, 0, sizeof(buffer));
+            memset(&source_address, 0, sizeof(source_address));
+
 
             if (recvfrom(sock, buffer, sizeof(buffer), 0, 
                          (struct sockaddr *)&source_address, &addr_len) <= 0) {
@@ -197,6 +216,7 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
 
+            retries=0;
             gettimeofday(&end, NULL);
 
             if (ip_v == 4) {
@@ -204,7 +224,7 @@ int main(int argc, char *argv[]) {
                 struct icmphdr *icmp_header = (struct icmphdr *)(buffer + ip_header->ihl * 4);
 
                 if (icmp_header->type == ICMP_ECHOREPLY) {
-                    float rtt = ((end.tv_sec - start.tv_sec) * 1000.0) + ((end.tv_usec - start.tv_usec) / 1000.0);
+                    float rtt = (float)((end.tv_sec - start.tv_sec) * 1000.0) + ((end.tv_usec - start.tv_usec) / 1000.0);
                     fprintf(stdout, "%ld bytes from %s: icmp_seq=%d ttl=%d time=%.2f ms\n",
                             (ntohs(ip_header->tot_len) - ip_header->ihl * 4 - sizeof(struct icmphdr)),
                             inet_ntoa(((struct sockaddr_in *)&source_address)->sin_addr),
@@ -213,7 +233,12 @@ int main(int argc, char *argv[]) {
                     rtts[rtt_count++] = rtt;
                     recive_pings++;
                 }
-            } else {
+            if (seq==MAX_REQUESTS){
+                break;
+                }
+            sleep(SLEEP_TIME);
+            } 
+            else {
                 struct icmp6_hdr *icmp6_header = (struct icmp6_hdr *)buffer;
 
                 if (icmp6_header->icmp6_type == ICMP6_ECHO_REPLY) {
@@ -226,6 +251,10 @@ int main(int argc, char *argv[]) {
                     recive_pings++;
                 }
             }
+            if (seq==MAX_REQUESTS){
+                break;
+            }
+
         }
 
         if (flood) {
@@ -262,7 +291,7 @@ unsigned short calculate_checksum(void *b, int len) {
 // Display ping statistics
 void display_results(float *result, char *addr) {
     if (rtt_count == 0) {
-        printf("No packets received.\n");
+        printf("--- %s ping statistics ---\nNo packets received.\n", addr);
         return;
     }
 
@@ -272,20 +301,10 @@ void display_results(float *result, char *addr) {
         if (result[i] > max) max = result[i];
         sum += result[i];
     }
+
     float avg = sum / rtt_count;
-    double std_dev = calculate_std(result, rtt_count, avg);
-
-    printf("--- %s ping statistics ---\n", addr);
-    printf("%d packets transmitted, %d received, %.2f%% packet loss\n",
-           sending_pings, recive_pings, 100.0 * (sending_pings - recive_pings) / sending_pings);
-    printf("rtt min/avg/max/stddev = %.2f/%.2f/%.2f/%.2f ms\n", min, avg, max, std_dev);
+    printf("--- %s ping statistics ---\n%d packets transmitted, %d received, %.1f%% packet loss\nrtt min/avg/max = %.2f/%.2f/%.2f ms\n",
+           addr, sending_pings, recive_pings,
+           100.0 * (sending_pings - recive_pings) / sending_pings, min, avg, max);
 }
 
-// Calculate standard deviation
-double calculate_std(float *arr, int size, float mean) {
-    double sum_of_squares = 0.0;
-    for (int i = 0; i < size; i++) {
-        sum_of_squares += (arr[i] - mean) * (arr[i] - mean);
-    }
-    return sqrt(sum_of_squares / size);
-}
