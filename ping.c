@@ -48,7 +48,7 @@ unsigned short calculate_checksum(void *b, int len) {
     return result;
 }
 
-
+// Check IPv6 availability
 int check_ipv6() {
     int trysocket = socket(AF_INET6, SOCK_DGRAM, 0);
     if (trysocket < 0) {
@@ -66,28 +66,6 @@ int check_ipv6() {
     
     return result == 0;
 }
-
-// int verify_address(const char *addr, int ip_v) {
-//     struct addrinfo hints, *res;
-//     memset(&hints, 0, sizeof(hints));
-    
-//     if (ip_version == 6) {
-//     hints.ai_family = AF_INET6;
-//     } 
-//     else {
-//         hints.ai_family = AF_INET;
-//     }
-//     hints.ai_socktype = SOCK_RAW;
-    
-//     int status = getaddrinfo(addr, NULL, &hints, &res);
-//     if (status != 0) {
-//         fprintf(stderr, "Error: Cannot resolve address: %s\n", gai_strerror(status));
-//         return 0;
-//     }
-    
-//     freeaddrinfo(res);
-//     return 1;
-// }
 
 // Display ping statistics
 void display(float *result, char *addr) {
@@ -145,25 +123,17 @@ int main(int argc, char *argv[]) {
                 return 1;
         }
     }
-    //if (!target_address || ip_v == 0)
-
     if (ip_v == 0) {
         fprintf(stderr, "Error: Address and IP version are required.\n");
         return 1;
     }
 
-    // Validate address and network availability
     if (ip_v == 6) {
         if (!check_ipv6()) {
             fprintf(stderr, "Error: IPv6 is not available on this system\n");
             return 1;
         }
     }
-
-    // if (!verify_address(target_address, ip_v)) {
-    //     return 1;
-    // }
-    
     
     rtts = (float *)malloc(ping_count * sizeof(float));
     if (rtts == NULL) {
@@ -182,12 +152,6 @@ int main(int argc, char *argv[]) {
             perror("Failed to create socket");
             free(rtts);
             return 1;
-        }
-
-        // Set IPV6 socket options
-        int on = 1;
-        if (setsockopt(sock, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &on, sizeof(on)) < 0) {
-            perror("Warning: setsockopt IPV6_RECVHOPLIMIT");
         }
 
         struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&dest_addr;
@@ -226,15 +190,15 @@ int main(int argc, char *argv[]) {
     fds[0].fd = sock;
     fds[0].events = POLLIN;
 
-    char *payload = "Ping test message";
-    int payload_size = strlen(payload);
+    char *msg = "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$^&*()_+{}|:<>?~`-=[]',.  ";
+    int payload_size = strlen(msg+ 1) ;
     char packet_buffer[BUFFER_SIZE] = {0};
     int retry_count = 0;
     int sequence = 0;
 
     printf("PING %s with %d bytes of data:\n", target_address, payload_size);
-
-    while (ping_count > 0) {
+    int max_packets = ping_count; 
+    while (ping_count > 0 && packets_sent < max_packets) {
         memset(packet_buffer, 0, sizeof(packet_buffer));
         struct timeval start, end;
         ssize_t sent_bytes = 0;
@@ -245,7 +209,7 @@ int main(int argc, char *argv[]) {
             icmp6->icmp6_code = 0;
             icmp6->icmp6_id = htons(getpid() & 0xFFFF);
             icmp6->icmp6_seq = htons(sequence);
-            memcpy(packet_buffer + sizeof(struct icmp6_hdr), payload, payload_size);
+            memcpy(packet_buffer + sizeof(struct icmp6_hdr), msg, payload_size);
             sent_bytes = sendto(sock, packet_buffer, sizeof(struct icmp6_hdr) + payload_size, 0,
                               (struct sockaddr *)&dest_addr, addr_len);
         }
@@ -255,7 +219,7 @@ int main(int argc, char *argv[]) {
             icmp4->code = 0;
             icmp4->un.echo.id = htons(getpid() & 0xFFFF);
             icmp4->un.echo.sequence = htons(sequence);
-            memcpy(packet_buffer + sizeof(struct icmphdr), payload, payload_size);
+            memcpy(packet_buffer + sizeof(struct icmphdr), msg, payload_size);
             icmp4->checksum = calculate_checksum(packet_buffer, sizeof(struct icmphdr) + payload_size);
             sent_bytes = sendto(sock, packet_buffer, sizeof(struct icmphdr) + payload_size, 0,
                               (struct sockaddr *)&dest_addr, addr_len);
@@ -274,12 +238,7 @@ int main(int argc, char *argv[]) {
 
         int poll_result = poll(fds, 1, TIMEOUT);
         if (poll_result == 0) {
-            if (++retry_count >= MAX_RETRY) {
-                fprintf(stderr, "Request timeout for icmp_seq %d, aborting.\n", sequence);
-                break;
-            }
-            fprintf(stderr, "Request timeout for icmp_seq %d, retrying...\n", sequence);
-            packets_sent--;
+            fprintf(stderr, "Request timeout for icmp_seq %d\n", sequence);
             continue;
         } else if (poll_result < 0) {
             perror("Poll failed");
@@ -302,7 +261,7 @@ int main(int argc, char *argv[]) {
 
             if (ip_v == 6) {
                 struct icmp6_hdr *icmp6 = (struct icmp6_hdr *)packet_buffer;
-                if (icmp6->icmp6_type == ICMP6_ECHO_REPLY) {
+                if (icmp6->icmp6_type == ICMP6_ECHO_REPLY && ntohs(icmp6->icmp6_seq) == sequence) {
                     char src_str[INET6_ADDRSTRLEN];
                     inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&source_addr)->sin6_addr,
                              src_str, sizeof(src_str));
