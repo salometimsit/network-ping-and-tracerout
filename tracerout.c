@@ -1,183 +1,135 @@
-#include <fcntl.h>
-#include <errno.h>
-#include <sys/socket.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/ip_icmp.h>
-#include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/ip_icmp.h>
+#include <netinet/ip.h>
 #include <sys/time.h>
-#include <signal.h>
-
-#define PACKETSIZE 64
-#define MAX_HOPS 30
-#define TRIES_PER_HOP 3
-#define RECV_TIMEOUT 1
-
-struct packet {
-    struct icmphdr hdr;
-    char msg[PACKETSIZE - sizeof(struct icmphdr)];
-};
-
-volatile sig_atomic_t keep_running = 1;
-char *dest_addr = NULL;
-
-void signal_handler(int signum) {
-    keep_running = 0;
-}
-
-unsigned short checksum(void *b, int len) {
+#include <errno.h>
+unsigned short calculate_checksum(void *b, int len) {
     unsigned short *buf = b;
     unsigned int sum = 0;
     unsigned short result;
 
-    for (sum = 0; len > 1; len -= 2)
+    for (sum = 0; len > 1; len -= 2) {
         sum += *buf++;
-    if (len == 1)
-        sum += *(unsigned char*)buf;
+    }
+    if (len == 1) {
+        sum += *(unsigned char *)buf;
+    }
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
     result = ~sum;
     return result;
 }
+void send_icmp_packet(int sock, struct sockaddr_in *dest, int ttl) {
+    char packet[64];
+    struct icmphdr *icmp_hdr = (struct icmphdr *)packet;
 
-int send_probe(int sd, struct sockaddr_in *addr, int ttl, int seq) {
-    struct packet pckt;
-    
-    // Set TTL for this probe
-    if (setsockopt(sd, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl)) != 0) {
-        perror("setsockopt ttl");
-        return -1;
+    memset(packet, 0, sizeof(packet));
+
+    // Fill ICMP Header
+    icmp_hdr->type = ICMP_ECHO;
+    icmp_hdr->code = 0;
+    icmp_hdr->checksum = 0;
+    icmp_hdr->un.echo.id = getpid();
+    icmp_hdr->un.echo.sequence = ttl;
+
+    // Calculate checksum
+    icmp_hdr->checksum = calculate_checksum(packet, sizeof(packet));
+
+    // Set the TTL
+    setsockopt(sock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
+
+    // Send the packet
+    if (sendto(sock, packet, sizeof(packet), 0, (struct sockaddr *)dest, sizeof(*dest)) < 0) {
+        perror("sendto");
+    }
+}
+int receive_icmp_response(int sock, struct timeval *start_time) {
+    char buffer[1024];
+    struct sockaddr_in recv_addr;
+    socklen_t addr_len = sizeof(recv_addr);
+    struct timeval end_time;
+
+    int bytes = recvfrom(sock, buffer, sizeof(buffer), 0, (struct sockaddr *)&recv_addr, &addr_len);
+    if (bytes < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return -1; // Timeout
+        } else {
+            perror("recvfrom");
+            return -1;
+        }
     }
 
-    // Prepare ICMP packet
-    memset(&pckt, 0, sizeof(pckt));
-    pckt.hdr.type = ICMP_ECHO;
-    pckt.hdr.code = 0;
-    pckt.hdr.un.echo.id = htons(getpid());
-    pckt.hdr.un.echo.sequence = htons(seq);
-    pckt.hdr.checksum = checksum(&pckt, sizeof(pckt));
+    gettimeofday(&end_time, NULL);
+    double rtt = (end_time.tv_sec - start_time->tv_sec) * 1000.0 + (end_time.tv_usec - start_time->tv_usec) / 1000.0;
 
-    return sendto(sd, &pckt, sizeof(pckt), 0, (struct sockaddr*)addr, sizeof(*addr));
+    struct iphdr *ip_hdr = (struct iphdr *)buffer;
+    struct icmphdr *icmp_hdr = (struct icmphdr *)(buffer + (ip_hdr->ihl * 4));
+
+    if (icmp_hdr->type == ICMP_TIME_EXCEEDED || icmp_hdr->type == ICMP_ECHOREPLY) {
+        printf("%s (RTT: %.2f ms)\n", inet_ntoa(recv_addr.sin_addr), rtt);
+        return (icmp_hdr->type == ICMP_ECHOREPLY) ? 1 : 0;
+    }
+
+    return 0;
 }
+void traceroute(const char *target) {
+    int send_sock, recv_sock;
+    struct sockaddr_in dest_addr;
+    struct timeval timeout = {2, 0}; 
 
-double process_reply(void *buf, int bytes, struct sockaddr_in *from) {
-    struct iphdr *ip = (struct iphdr*)buf;
-    struct icmphdr *icmp = (struct icmphdr*)(buf + ip->ihl * 4);
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    if (!inet_aton(target, &dest_addr.sin_addr)) {
+        perror("inet_aton");
+        exit(EXIT_FAILURE);
+    }
+
+
+    send_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (send_sock < 0) {
+        perror("send socket");
+        exit(EXIT_FAILURE);
+    }
+    recv_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (recv_sock < 0) {
+        perror("recv socket");
+        exit(EXIT_FAILURE);
+    }
+    setsockopt(recv_sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
     
-    char src_addr[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(from->sin_addr), src_addr, INET_ADDRSTRLEN);
-    
-    struct timeval recv_time;
-    gettimeofday(&recv_time, NULL);
-    
-    return (double)recv_time.tv_usec / 1000.0;
+    for (int ttl = 1; ttl <= 30; ttl++) {
+        printf("TTL=%d: ", ttl);
+
+        struct timeval start_time;
+        gettimeofday(&start_time, NULL);
+
+        send_icmp_packet(send_sock, &dest_addr, ttl);
+        int status = receive_icmp_response(recv_sock, &start_time);
+
+        if (status == 1) {
+            printf("Destination reached.\n");
+            break;
+        } else if (status == -1) {
+            printf("* (timeout)\n");
+        }
+    }
+
+    close(send_sock);
+    close(recv_sock);
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 3 || strcmp(argv[1], "-a") != 0) {
-        printf("Usage: %s -a <destination>\n", argv[0]);
-        exit(1);
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <target>\n", argv[0]);
+        exit(EXIT_FAILURE);
     }
-    
-    dest_addr = argv[2];
-    struct hostent *hname;
-    struct sockaddr_in addr;
-    struct protoent *proto;
-    
-    signal(SIGINT, signal_handler);
-    
-    proto = getprotobyname("ICMP");
-    if (!proto) {
-        perror("getprotobyname");
-        exit(1);
-    }
-    hname = gethostbyname(dest_addr);
-    if (!hname) {
-        fprintf(stderr, "Could not resolve hostname %s\n", dest_addr);
-        exit(1);
-    }
-    
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = hname->h_addrtype;
-    addr.sin_port = 0;
-    memcpy(&addr.sin_addr.s_addr, hname->h_addr_list[0], hname->h_length);
-    
-    printf("traceroute to %s (%s), %d hops max\n", 
-           dest_addr, 
-           inet_ntoa(addr.sin_addr), 
-           MAX_HOPS);
-    
-    int send_sd = socket(AF_INET, SOCK_RAW, proto->p_proto);
-    if (send_sd < 0) {
-        perror("socket");
-        exit(1);
-    }
-    int recv_sd = socket(AF_INET, SOCK_RAW, proto->p_proto);
-    if (recv_sd < 0) {
-        perror("socket");
-        exit(1);
-    }
-    struct timeval tv;
-    tv.tv_sec = RECV_TIMEOUT;
-    tv.tv_usec = 0;
-    setsockopt(recv_sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    
-    for (int ttl = 1; ttl <= MAX_HOPS && keep_running; ttl++) {
-        printf("%2d ", ttl);
-        
-        char current_addr[INET_ADDRSTRLEN] = {0};
-        int reached_dest = 0;
-        
-        for (int try = 0; try < TRIES_PER_HOP; try++) {
-            if (send_probe(send_sd, &addr, ttl, try + 1) < 0) {
-                printf(" *");
-                continue;
-            }
-            
-            struct sockaddr_in recv_addr;
-            socklen_t recv_addr_len = sizeof(recv_addr);
-            char recv_buf[512];
-            
-            int bytes = recvfrom(recv_sd, recv_buf, sizeof(recv_buf), 0,
-                               (struct sockaddr*)&recv_addr, &recv_addr_len);
-            
-            if (bytes < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    printf(" *");
-                    continue;
-                }
-                perror("recvfrom");
-                continue;
-            }
-            
-            char hop_addr[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &(recv_addr.sin_addr), hop_addr, INET_ADDRSTRLEN);
-            
-            if (strlen(current_addr) == 0) {
-                strcpy(current_addr, hop_addr);
-                printf(" %s", hop_addr);
-            }
-            
-            double rtt = process_reply(recv_buf, bytes, &recv_addr);
-            printf(" %.3fms", rtt);
-            if (strcmp(hop_addr, inet_ntoa(addr.sin_addr)) == 0) {
-                reached_dest = 1;
-            }
-        }
-        
-        printf("\n");
-        
-        if (reached_dest) {
-            break;
-        }
-    }
-    
-    close(send_sd);
-    close(recv_sd);
+
+    traceroute(argv[1]);
     return 0;
 }
