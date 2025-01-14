@@ -1,431 +1,344 @@
-#include <fcntl.h>
-#include <errno.h>
-#include <sys/socket.h>
-#include <netdb.h>
+#include <stdio.h>
+#include <sys/types.h>    
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
-#include <netinet/ip6.h>
-#include <arpa/inet.h>
-#include <stdio.h>
 #include <netinet/ip_icmp.h>
-#include <arpa/inet.h>
+#include <netinet/icmp6.h>
+#include <poll.h>
+#include <errno.h>
 #include <stdlib.h>
-#include <strings.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/wait.h>
+#include <sys/socket.h>
 #include <sys/time.h>
-#include <signal.h>
-#include <sys/mman.h>
-#include <float.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <math.h>
+#include <netdb.h> 
 
-#define PACKETSIZE 64
-#define MAX_PACKETS 100
+// Constants
+#define MAX_REQUESTS 4
+#define TIMEOUT 1000
+#define BUFFER_SIZE 1024
+#define SLEEP_TIME 1
+#define MAX_RETRY 3
 
-/**
- * Method Goal:
- *      Represents an ICMP packet with a header and a message
- */
-struct packet {
-    struct icmphdr hdr;
-    char msg[PACKETSIZE - sizeof(struct icmphdr)];
-};
+// Global variables
+unsigned int packets_sent = 0;
+unsigned int packets_received = 0;
+unsigned int rtt_count = 0;
+float *rtts = NULL;
 
-//--------------------------------------------------------------------------------------------
-/**
- * Method Goal:
- *      Represents shared data used for statistics across multiple processes.
- */
-struct shared_data {
-    int sent_packets;
-    int received_packets;
-    double min_time;        //of RTT
-    double max_time;
-    double total_time;
-    struct timeval send_times[MAX_PACKETS];
-};
-//--------------------------------------------------------------------------------------------
-// Defining global variables
-volatile sig_atomic_t keep_running = 1;
-struct shared_data *shared = NULL;
-int pid = -1;
-int loops = 4;
-char *address = "0.0.0.0";
-int ttl = 56;
-int sleepTime = 1;
-int ip_v = 4;
-struct protoent *proto = NULL;
-//--------------------------------------------------------------------------------------------
-/**
- * @brief Handles termination signals (e.g., SIGINT or SIGTERM).
- * @param signum Signal number
- */
-void signal_handler(int signum) {
-    keep_running = 0;
-}
-
-//--------------------------------------------------------------------------------------------
-/**
- * Method Goals:
-*      Creates and initializes shared memory for storing statistics.
-* Return:
- *      Pointer to shared_data structure
- */
-struct shared_data* shared_mem() {
-    void *ptr = mmap(NULL, sizeof(struct shared_data),PROT_READ | PROT_WRITE,MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (ptr == MAP_FAILED) {
-        perror("mmap");
-        exit(1);
-    }
-    memset(ptr, 0, sizeof(struct shared_data));
-    return (struct shared_data*)ptr;
-}
-
-//--------------------------------------------------------------------------------------------
-/**
- * Method Goals:
- *      receives a poointer to the packet and the length and computes the checksum for an ICMP packet.
- * Returns:
- *         Checksum value
- */
-unsigned short checksum(void *b, int len) {
+// Calculate checksum for ICMP packets
+unsigned short calculate_checksum(void *b, int len) {
     unsigned short *buf = b;
     unsigned int sum = 0;
     unsigned short result;
 
-    for (sum = 0; len > 1; len -= 2)
+    while (len > 1) {
         sum += *buf++;
-    if (len == 1)
-        sum += *(unsigned char*)buf;
+        len -= 2;
+    }
+    if (len == 1) {
+        sum += *(unsigned char *)buf;
+    }
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
     result = ~sum;
     return result;
 }
 
-//--------------------------------------------------------------------------------------------
-/**
- * Method Goals:
- *         receives a pointer to the buffer that contains the packet and also receives number of bytes in the packet
- *          and it displays IPv4 packet details.
- */
-void displayipv4(void *buf, int bytes) {
-    struct iphdr *ip = (struct iphdr *)buf;
-    struct icmphdr *icmp = (struct icmphdr *)(buf + ip->ihl * 4);
-    
-    printf("\n-----ipv4------\n");
-    printf("-------------------\n");
-    
-    char sourceIPADDReadable[INET_ADDRSTRLEN];
-    char destinationIPADDReadable[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &ip->saddr, sourceIPADDReadable, sizeof(sourceIPADDReadable));
-    inet_ntop(AF_INET, &ip->daddr, destinationIPADDReadable, sizeof(destinationIPADDReadable));
-    
-    printf("Source: %s\n", sourceIPADDReadable);
-    printf("Destination: %s\n", destinationIPADDReadable);
-    printf("Version: IPv%d\nHeader Size: %d bytes\nPacket Size: %d bytes\nProtocol: %d\nTTL: %d\n",
-           ip->version, ip->ihl * 4, ntohs(ip->tot_len), ip->protocol, ip->ttl);
 
-    if (icmp->type == ICMP_ECHOREPLY && icmp->un.echo.id == htons(pid)) {
-        printf("ICMP Echo Reply:\n");
-        printf("Type: %d\nCode: %d\nChecksum: %d\nID: %d\nSequence: %d\n",
-               icmp->type, icmp->code, icmp->checksum,
-               ntohs(icmp->un.echo.id), ntohs(icmp->un.echo.sequence));
+int check_ipv6() {
+    int trysocket = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (trysocket < 0) {
+        return 0;
     }
-    printf("-------------------\n");
+    
+    struct sockaddr_in6 test_addr;
+    memset(&test_addr, 0, sizeof(test_addr));
+    test_addr.sin6_family = AF_INET6;
+    inet_pton(AF_INET6, "::1", &test_addr.sin6_addr);
+    test_addr.sin6_port = htons(0);
+    
+    int result = connect(trysocket, (struct sockaddr *)&test_addr, sizeof(test_addr));
+    close(trysocket);
+    
+    return result == 0;
 }
 
-//--------------------------------------------------------------------------------------------
-/**
- * Method Goals:
- *         receives a pointer to the buffer that contains the packet and also receives number of bytes in the packet
- *          and it displays IPv6 packet details.
- */
-void displayipv6(void *buf, int bytes) {
-    printf("-----ipv6------\n");
-    struct ip6_hdr *ip = (struct ip6_hdr *)buf;
-    struct icmphdr *icmp = (struct icmphdr *)(buf + sizeof(struct ip6_hdr));
+// int verify_address(const char *addr, int ip_v) {
+//     struct addrinfo hints, *res;
+//     memset(&hints, 0, sizeof(hints));
     
-    printf("-------------------\n");
+//     if (ip_version == 6) {
+//     hints.ai_family = AF_INET6;
+//     } 
+//     else {
+//         hints.ai_family = AF_INET;
+//     }
+//     hints.ai_socktype = SOCK_RAW;
     
-    char sourceIPADDReadable[INET6_ADDRSTRLEN] = {'\0'};
-    char destinationIPADDReadable[INET6_ADDRSTRLEN] = {'\0'};
-    inet_ntop(AF_INET6, &ip->ip6_src, sourceIPADDReadable, sizeof(sourceIPADDReadable));
-    inet_ntop(AF_INET6, &ip->ip6_dst, destinationIPADDReadable, sizeof(destinationIPADDReadable));
+//     int status = getaddrinfo(addr, NULL, &hints, &res);
+//     if (status != 0) {
+//         fprintf(stderr, "Error: Cannot resolve address: %s\n", gai_strerror(status));
+//         return 0;
+//     }
     
-    printf("Source: %s\n", sourceIPADDReadable);
-    printf("Destination: %s\n", destinationIPADDReadable);
-    printf("Version: IPv6\n");
-    printf("Traffic Class: %d\n", (ip->ip6_ctlun.ip6_un1.ip6_un1_flow >> 20) & 0xff);
-    printf("Flow Label: %d\n", ip->ip6_ctlun.ip6_un1.ip6_un1_flow & 0xfffff);
-    printf("Payload Length: %d\n", ntohs(ip->ip6_ctlun.ip6_un1.ip6_un1_plen));
-    printf("Next Header: %d\n", ip->ip6_ctlun.ip6_un1.ip6_un1_nxt);
-    printf("Hop Limit: %d\n", ip->ip6_ctlun.ip6_un1.ip6_un1_hlim);
+//     freeaddrinfo(res);
+//     return 1;
+// }
 
-    if (icmp->un.echo.id == htons(pid)) {
-        printf("ICMP: type[%d/%d] checksum[%d] id[%d] seq[%d]\n", 
-               icmp->type, icmp->code, icmp->checksum,
-               ntohs(icmp->un.echo.id), ntohs(icmp->un.echo.sequence));
-    }
-    printf("-------------------\n");
-}
+// Display ping statistics
+void display(float *result, char *addr) {
+    printf("\n--- %s ping statistics ---\n", addr);
+    printf("%u packets transmitted, %u received, %.1f%% packet loss\n",
+           packets_sent, packets_received,
+           100.0 * (packets_sent - packets_received) / packets_sent);
 
-//--------------------------------------------------------------------------------------------
-/**
- * Methods Goal:
- *          receives a pointer to the buffer where the packet is located, 
- *          and number of bytes in the packet
- *          and then displays packet details based on IP version.
- */
-void display(void *buf, int bytes) {
-    if (ip_v == 4) {
-        displayipv4(buf, bytes);
-    } else if (ip_v == 6) {
-        displayipv6(buf, bytes);
-    } else {
-        printf("Unknown IP version\n");
-    }
-}
-
-//--------------------------------------------------------------------------------------------
-/**
- * Methods Goal:
- *      receives a pointer to the buffer containing the packet 
- *      and also the number of bytes in the packet 
- *      and it processes a received ICMP packet and calculates round-trip time (RTT).
- */
-void process(void *buf, int bytes) {
-    struct iphdr *ip = (struct iphdr*)buf;
-    struct icmphdr *icmp = (struct icmphdr*)(buf + ip->ihl * 4);
-    struct timeval recv_time;
-    display(buf, bytes);
-    
-    gettimeofday(&recv_time, NULL);
-
-    if (icmp->type == ICMP_ECHOREPLY && icmp->un.echo.id == htons(pid)) {
-        int seq = ntohs(icmp->un.echo.sequence) - 1;
-        if (seq >= 0 && seq < MAX_PACKETS) {
-            shared->received_packets++;
-            
-            double rtt = (recv_time.tv_sec - shared->send_times[seq].tv_sec) * 1000.0 +
-                        (recv_time.tv_usec - shared->send_times[seq].tv_usec) / 1000.0;
-            
-            // Update statistics
-            if (shared->received_packets == 1 || rtt < shared->min_time)
-                shared->min_time = rtt;
-            if (rtt > shared->max_time)
-                shared->max_time = rtt;
-            shared->total_time += rtt;
-            
-            printf("%d bytes from %s: icmp_seq=%d ttl=%d time=%.3f ms\n",
-                   bytes - sizeof(struct iphdr),
-                   inet_ntoa(*(struct in_addr*)&ip->saddr),
-                   seq + 1,
-                   ip->ttl,
-                   rtt);
+    if (packets_received > 0) {
+        float min = result[0];
+        float max = result[0];
+        float sum = result[0];
+        for (unsigned int i = 1; i < packets_received; i++) {
+            if (result[i] < min) min = result[i];
+            if (result[i] > max) max = result[i];
+            sum += result[i];
         }
+        printf("rtt min/avg/max = %.2f/%.2f/%.2f ms\n",
+               min, sum/packets_received, max);
     }
 }
 
-//--------------------------------------------------------------------------------------------
-/**
- * Methods Goal:
- *          Listens for ICMP Echo Reply packets and processes them.
- *          this function is connected to the process function
- */
-void listener(void) {
-    int sd;
-    struct sockaddr_in addr;
-    unsigned char buf[1024];
-
-    sd = socket(PF_INET, SOCK_RAW, proto->p_proto);
-    if (sd < 0) {
-        perror("socket");
-        exit(1);
-    }
-
-    struct timeval tv;
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
-    setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    while (keep_running && shared->received_packets < loops) {
-        int bytes, len = sizeof(addr);
-        bzero(buf, sizeof(buf));
-        bytes = recvfrom(sd, buf, sizeof(buf), 0, (struct sockaddr*)&addr, &len);
-        if (bytes > 0) {
-            process(buf, bytes);
-        }
-    }
-    close(sd);
-    exit(0);
-}
-
-//--------------------------------------------------------------------------------------------
-/**
- * Methods Goal:
- *          receives a pointer to the destenantion address
- *          and sends ICMP Echo Request packets and records send times.
- *          this function is the main method that connects all the dots
- */
-void ping(struct sockaddr_in *addr) {
-    int sd = socket(PF_INET, SOCK_RAW, proto->p_proto);
-    if (sd < 0) {
-        perror("socket");
-        return;
-    }
-
-    if (setsockopt(sd, SOL_IP, IP_TTL, &ttl, sizeof(ttl)) != 0) {
-        perror("set TTL option");
-    }
-
-    printf("PING %s (%s): %d data bytes\n", 
-           address, 
-           inet_ntoa(addr->sin_addr),
-           PACKETSIZE - sizeof(struct icmphdr));
-
-    struct packet pckt;
-    int sequence = 0;
-
-    while (keep_running && sequence < loops) {
-        bzero(&pckt, sizeof(pckt));
-        pckt.hdr.type = ICMP_ECHO;
-        pckt.hdr.code = 0;
-        pckt.hdr.un.echo.id = htons(pid);
-        pckt.hdr.un.echo.sequence = htons(sequence + 1);
-
-        // Store send time
-        gettimeofday(&shared->send_times[sequence], NULL);
-
-        for (int j = 0; j < sizeof(pckt.msg) - 1; j++) {
-            pckt.msg[j] = j + '0';
-        }
-
-        pckt.hdr.checksum = checksum(&pckt, sizeof(pckt));
-
-        if (sendto(sd, &pckt, sizeof(pckt), 0, (struct sockaddr*)addr, sizeof(*addr)) <= 0) {
-            perror("sendto");
-        } else {
-            shared->sent_packets++;
-            sequence++;
-        }
-
-        sleep(sleepTime);
-    }
-
-    close(sd);
-}
-
-//--------------------------------------------------------------------------------------------
-/**
- * Methods Goal: 
- *          receives argc and argv command lind arguments 
- *          this is the function that handles argument parsing, setup, and execution.
- * Return: 
- *      Exit status
- */
 int main(int argc, char *argv[]) {
-    struct hostent *hname;
-    struct sockaddr_in addr;
-
-    if (argc < 2) {
-        printf("Usage: %s <hostname> [-c count] [-f] [-t 4|6]\n", argv[0]);
-        exit(1);
-    }
-
-    // Create shared memory and initialize
-    shared = shared_mem();
-    
-    // Set up signal handlers
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-
-    // Parse command line arguments
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-a") == 0 && i + 1 < argc) {
-            address = argv[i + 1];
-            i++;
-        }
-        else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            loops = atoi(argv[i + 1]);
-            if (loops <= 0 || loops > MAX_PACKETS) {
-                printf("Invalid count value. Using default: 4\n");
-                loops = 4;
-            }
-            i++;
-        }
-        else if (strcmp(argv[i], "-f") == 0) {
-            sleepTime = 0;
-        }
-        else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
-            if (strcmp(argv[i + 1], "4") == 0) {
-                ip_v = 4;
-            } else if (strcmp(argv[i + 1], "6") == 0) {
-                ip_v = 6;
-            } else {
-                fprintf(stderr, "Unknown IP version\n");
-                return -1;
-            }
-            i++;
-        }
-    }
-
-    // Get ICMP protocol
-    proto = getprotobyname("ICMP");
-    if (!proto) {
-        perror("getprotobyname");
-        exit(1);
-    }
-
-    // Resolve hostname
-    hname = gethostbyname(address);
-    if (!hname) {
-        fprintf(stderr, "Could not resolve hostname %s\n", address);
-        exit(1);
-    }
-
-    // Set up address structure
-    bzero(&addr, sizeof(addr));
-    addr.sin_family = hname->h_addrtype;
-    addr.sin_port = 0;
-    memcpy(&addr.sin_addr.s_addr, hname->h_addr_list[0], hname->h_length);
-
-    // Get process ID
-    pid = getpid();
-
-    // Fork and run listener and ping
-    pid_t child_pid = fork();
-    if (child_pid < 0) {
-        perror("fork");
+    if (argc < 5) {
+        fprintf(stderr, "Usage: %s -a <address> -t <type> [-c <count>] [-f]\n", argv[0]);
         return 1;
     }
 
-    if (child_pid == 0) {
-        listener();
-    } else {
-        ping(&addr);
-        sleep(1);  // Give listener time to process final packets
-        kill(child_pid, SIGTERM);
-        wait(NULL);
+    int ping_count = MAX_REQUESTS;
+    int flood_mode = 0;
+    int ip_v = 0;
+    char *target_address = NULL;
+    int opt;
+    
+    while ((opt = getopt(argc, argv, "a:t:c:f")) != -1) {
+        switch (opt) {
+            case 'a':
+                target_address = optarg;
+                break;
+            case 't':
+                ip_v = atoi(optarg);
+                if (ip_v != 4 && ip_v != 6) {
+                    fprintf(stderr, "Error: Invalid type '%s'. Use 4 for IPv4 or 6 for IPv6.\n", optarg);
+                    return 1;
+                }
+                break;
+            case 'c':
+                ping_count = atoi(optarg);
+                break;
+            case 'f':
+                flood_mode = 1;
+                break;
+            default:
+                fprintf(stderr, "Usage: %s -a <address> -t <type> [-c <count>] [-f]\n", argv[0]);
+                return 1;
+        }
+    }
+    //if (!target_address || ip_v == 0)
 
-        // Print statistics
-        printf("\n--- %s ping statistics ---\n", address);
-        if (shared->sent_packets > 0) {
-            printf("%d packets transmitted, %d received, %.1f%% packet loss\n",
-                   shared->sent_packets, 
-                   shared->received_packets,
-                   100.0 * (shared->sent_packets - shared->received_packets) / shared->sent_packets);
-            
-            if (shared->received_packets > 0) {
-                double avg_time = shared->total_time / shared->received_packets;
-                printf("round-trip min/avg/max = %.3f/%.3f/%.3f ms\n",
-                       shared->min_time, avg_time, shared->max_time);
+    if (ip_v == 0) {
+        fprintf(stderr, "Error: Address and IP version are required.\n");
+        return 1;
+    }
+
+    // Validate address and network availability
+    if (ip_v == 6) {
+        if (!check_ipv6()) {
+            fprintf(stderr, "Error: IPv6 is not available on this system\n");
+            return 1;
+        }
+    }
+
+    // if (!verify_address(target_address, ip_v)) {
+    //     return 1;
+    // }
+    
+    
+    rtts = (float *)malloc(ping_count * sizeof(float));
+    if (rtts == NULL) {
+        perror("Failed to allocate memory");
+        return 1;
+    }
+
+    int sock = -1;
+    struct sockaddr_storage dest_addr;
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    socklen_t addr_len;
+
+    if (ip_v == 6) {
+        sock = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+        if (sock < 0) {
+            perror("Failed to create socket");
+            free(rtts);
+            return 1;
+        }
+
+        // Set IPV6 socket options
+        int on = 1;
+        if (setsockopt(sock, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &on, sizeof(on)) < 0) {
+            perror("Warning: setsockopt IPV6_RECVHOPLIMIT");
+        }
+
+        struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&dest_addr;
+        addr6->sin6_family = AF_INET6;
+        if (inet_pton(AF_INET6, target_address, &addr6->sin6_addr) <= 0) {
+            fprintf(stderr, "Error: Invalid IPv6 address\n");
+            close(sock);
+            free(rtts);
+            return 1;
+        }
+        addr_len = sizeof(struct sockaddr_in6);
+    } 
+    else {
+        sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+        if (sock < 0) {
+            perror("Failed to create socket");
+            if (errno == EACCES || errno == EPERM) {
+                fprintf(stderr, "You need to run the program with sudo.\n");
+            }
+            free(rtts);
+            return 1;
+        }
+
+        struct sockaddr_in *addr4 = (struct sockaddr_in *)&dest_addr;
+        addr4->sin_family = AF_INET;
+        if (inet_pton(AF_INET, target_address, &addr4->sin_addr) <= 0) {
+            fprintf(stderr, "Error: Invalid IPv4 address\n");
+            close(sock);
+            free(rtts);
+            return 1;
+        }
+        addr_len = sizeof(struct sockaddr_in);
+    }
+
+    struct pollfd fds[1];
+    fds[0].fd = sock;
+    fds[0].events = POLLIN;
+
+    char *payload = "Ping test message";
+    int payload_size = strlen(payload);
+    char packet_buffer[BUFFER_SIZE] = {0};
+    int retry_count = 0;
+    int sequence = 0;
+
+    printf("PING %s with %d bytes of data:\n", target_address, payload_size);
+
+    while (ping_count > 0) {
+        memset(packet_buffer, 0, sizeof(packet_buffer));
+        struct timeval start, end;
+        ssize_t sent_bytes = 0;
+
+        if (ip_v == 6) {
+            struct icmp6_hdr *icmp6 = (struct icmp6_hdr *)packet_buffer;
+            icmp6->icmp6_type = ICMP6_ECHO_REQUEST;
+            icmp6->icmp6_code = 0;
+            icmp6->icmp6_id = htons(getpid() & 0xFFFF);
+            icmp6->icmp6_seq = htons(sequence);
+            memcpy(packet_buffer + sizeof(struct icmp6_hdr), payload, payload_size);
+            sent_bytes = sendto(sock, packet_buffer, sizeof(struct icmp6_hdr) + payload_size, 0,
+                              (struct sockaddr *)&dest_addr, addr_len);
+        }
+        else {
+            struct icmphdr *icmp4 = (struct icmphdr *)packet_buffer;
+            icmp4->type = ICMP_ECHO;
+            icmp4->code = 0;
+            icmp4->un.echo.id = htons(getpid() & 0xFFFF);
+            icmp4->un.echo.sequence = htons(sequence);
+            memcpy(packet_buffer + sizeof(struct icmphdr), payload, payload_size);
+            icmp4->checksum = calculate_checksum(packet_buffer, sizeof(struct icmphdr) + payload_size);
+            sent_bytes = sendto(sock, packet_buffer, sizeof(struct icmphdr) + payload_size, 0,
+                              (struct sockaddr *)&dest_addr, addr_len);
+        }
+
+        if (sent_bytes < 0) {
+            if (errno == ENETUNREACH) {
+                fprintf(stderr, "Error: Network is unreachable\n");
+                break;
+            }
+            perror("Failed to send packet");
+            continue;
+        }
+        packets_sent++;
+        gettimeofday(&start, NULL);
+
+        int poll_result = poll(fds, 1, TIMEOUT);
+        if (poll_result == 0) {
+            if (++retry_count >= MAX_RETRY) {
+                fprintf(stderr, "Request timeout for icmp_seq %d, aborting.\n", sequence);
+                break;
+            }
+            fprintf(stderr, "Request timeout for icmp_seq %d, retrying...\n", sequence);
+            packets_sent--;
+            continue;
+        } else if (poll_result < 0) {
+            perror("Poll failed");
+            break;
+        }
+
+        if (fds[0].revents & POLLIN) {
+            struct sockaddr_storage source_addr;
+            socklen_t source_len = sizeof(source_addr);
+            ssize_t received = recvfrom(sock, packet_buffer, sizeof(packet_buffer), 0,
+                                      (struct sockaddr *)&source_addr, &source_len);
+            if (received < 0) {
+                perror("Failed to receive packet");
+                continue;
+            }
+
+            gettimeofday(&end, NULL);
+            float rtt = ((end.tv_sec - start.tv_sec) * 1000.0) +
+                       ((end.tv_usec - start.tv_usec) / 1000.0);
+
+            if (ip_v == 6) {
+                struct icmp6_hdr *icmp6 = (struct icmp6_hdr *)packet_buffer;
+                if (icmp6->icmp6_type == ICMP6_ECHO_REPLY) {
+                    char src_str[INET6_ADDRSTRLEN];
+                    inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&source_addr)->sin6_addr,
+                             src_str, sizeof(src_str));
+                    printf("%d bytes from %s: icmp_seq=%d time=%.2f ms\n",
+                           payload_size, src_str, ntohs(icmp6->icmp6_seq), rtt);
+                    rtts[rtt_count++] = rtt;
+                    packets_received++;
+                    retry_count = 0;
+                    ping_count--;
+                    sequence++;
+                }
+            } else {
+                struct iphdr *ip_header = (struct iphdr *)packet_buffer;
+                struct icmphdr *icmp4 = (struct icmphdr *)(packet_buffer + ip_header->ihl * 4);
+                if (icmp4->type == ICMP_ECHOREPLY) {
+                    printf("%d bytes from %s: icmp_seq=%d ttl=%d time=%.2f ms\n",
+                           payload_size, inet_ntoa(((struct sockaddr_in *)&source_addr)->sin_addr),
+                           ntohs(icmp4->un.echo.sequence), ip_header->ttl, rtt);
+                    rtts[rtt_count++] = rtt;
+                    packets_received++;
+                    retry_count = 0;
+                    ping_count--;
+                    sequence++;
+                }
             }
         }
 
-        // Clean up shared memory
-        munmap(shared, sizeof(struct shared_data));
+        if (!flood_mode) {
+            sleep(SLEEP_TIME);
+        } else {
+            usleep(1000);
+        }
     }
 
+    display(rtts, target_address);
+    free(rtts);
+    close(sock);
     return 0;
 }
