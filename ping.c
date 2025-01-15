@@ -29,7 +29,17 @@ unsigned int packets_received = 0;
 unsigned int rtt_count = 0;
 float *rtts = NULL;
 
-// Calculate checksum for ICMP packets
+/****
+ * Method Goal:
+ *  Calculate the checksum for ICMP packets to ensure data integrity
+ * Takes a buffer of data and its length
+    Performs a 16-bit one's complement sum over the buffer
+    Handles odd-length buffers
+    Folds the 32-bit sum into 16 bits
+* Return:
+    16-bit checksum value for the ICMP packet
+
+ */
 unsigned short calculate_checksum(void *b, int len) {
     unsigned short *buf = b;
     unsigned int sum = 0;
@@ -47,8 +57,19 @@ unsigned short calculate_checksum(void *b, int len) {
     result = ~sum;
     return result;
 }
+//---------------------------------------------------------------------------------------------------
 
-// Check IPv6 availability
+/****
+ * Method Goal:
+ *  Verify if IPv6 is supported on the current system
+ * Attempts to create an IPv6 socket
+    Tries to connect to the IPv6 loopback address (::1)
+    Cleans up resources regardless of the result
+*Returns:
+    1 if IPv6 is available
+    0 if IPv6 is not supported
+
+ */
 int check_ipv6() {
     int trysocket = socket(AF_INET6, SOCK_DGRAM, 0);
     if (trysocket < 0) {
@@ -66,8 +87,19 @@ int check_ipv6() {
     
     return result == 0;
 }
+//---------------------------------------------------------------------------------------------------
 
-// Display ping statistics
+/****
+ * Method Goal:
+ *  Show final ping statistics to the user
+ * Calculates packet loss percentage
+    If packets were received:
+    Finds minimum RTT
+    Finds maximum RTT
+    Calculates average RTT
+    Prints formatted statistics
+
+ */
 void display(float *result, char *addr) {
     printf("\n--- %s ping statistics ---\n", addr);
     printf("%u packets transmitted, %u received, %.1f%% packet loss\n",
@@ -99,7 +131,13 @@ int main(int argc, char *argv[]) {
     int ip_v = 0;
     char *target_address = NULL;
     int opt;
-    
+    /***
+     * Parse command line arguments:
+        Target address (-a)
+        IP version (-t)
+        Optional count (-c)
+        Optional flood mode (-f)
+     */
     while ((opt = getopt(argc, argv, "a:t:c:f")) != -1) {
         switch (opt) {
             case 'a':
@@ -127,7 +165,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: Address and IP version are required.\n");
         return 1;
     }
-
+    //Validate inputs and check IPv6 availability if needed
     if (ip_v == 6) {
         if (!check_ipv6()) {
             fprintf(stderr, "Error: IPv6 is not available on this system\n");
@@ -141,6 +179,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /***
+     * SOCKET CREATION:
+     * Goal: Create and configure the appropriate socket based on IP version
+        What it Does:
+        Creates raw socket for either IPv4 or IPv6
+        Sets up appropriate filters for IPv6
+        Configures socket options
+        Sets up destination address structure
+     */
+    
     int sock = -1;
     struct sockaddr_storage dest_addr;
     memset(&dest_addr, 0, sizeof(dest_addr));
@@ -150,6 +198,17 @@ int main(int argc, char *argv[]) {
         sock = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
         if (sock < 0) {
             perror("Failed to create socket");
+            free(rtts);
+            return 1;
+        }
+
+        // Set ICMPv6 filter
+        struct icmp6_filter filter;
+        ICMP6_FILTER_SETBLOCKALL(&filter);
+        ICMP6_FILTER_SETPASS(ICMP6_ECHO_REPLY, &filter);
+        if (setsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, &filter, sizeof(filter)) < 0) {
+            perror("setsockopt ICMP6_FILTER");
+            close(sock);
             free(rtts);
             return 1;
         }
@@ -189,16 +248,26 @@ int main(int argc, char *argv[]) {
     struct pollfd fds[1];
     fds[0].fd = sock;
     fds[0].events = POLLIN;
+    /***
+     * sending packets:
+     * Goal: Construct and send ICMP packets
+        What it Does:
+
+        Builds appropriate ICMP header (v4 or v6)
+        Sets sequence numbers and identifiers
+        Calculates checksums (IPv4 only)
+        Sends packet to destination
+            */
 
     char *msg = "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$^&*()_+{}|:<>?~`-=[]',.  ";
-    int payload_size = strlen(msg+ 1) ;
+    int payload_size = strlen(msg + 1);
     char packet_buffer[BUFFER_SIZE] = {0};
     int retry_count = 0;
     int sequence = 0;
 
     printf("PING %s with %d bytes of data:\n", target_address, payload_size);
-    int max_packets = ping_count; 
-    while (ping_count > 0 && packets_sent < max_packets) {
+    
+    while (ping_count > 0) {
         memset(packet_buffer, 0, sizeof(packet_buffer));
         struct timeval start, end;
         ssize_t sent_bytes = 0;
@@ -233,9 +302,12 @@ int main(int argc, char *argv[]) {
             perror("Failed to send packet");
             continue;
         }
-        packets_sent++;
+        
+        if (sent_bytes > 0) {
+            packets_sent++;
+        }
+        
         gettimeofday(&start, NULL);
-
         int poll_result = poll(fds, 1, TIMEOUT);
         if (poll_result == 0) {
             fprintf(stderr, "Request timeout for icmp_seq %d\n", sequence);
@@ -261,19 +333,38 @@ int main(int argc, char *argv[]) {
 
             if (ip_v == 6) {
                 struct icmp6_hdr *icmp6 = (struct icmp6_hdr *)packet_buffer;
-                if (icmp6->icmp6_type == ICMP6_ECHO_REPLY && ntohs(icmp6->icmp6_seq) == sequence) {
+                int expected_id = getpid() & 0xFFFF;
+    
+                if (icmp6->icmp6_type == ICMP6_ECHO_REPLY && 
+                    ntohs(icmp6->icmp6_id) == expected_id &&
+                    ntohs(icmp6->icmp6_seq) == sequence) {
+                    
                     char src_str[INET6_ADDRSTRLEN];
                     inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&source_addr)->sin6_addr,
                              src_str, sizeof(src_str));
+                     
                     printf("%d bytes from %s: icmp_seq=%d time=%.2f ms\n",
-                           payload_size, src_str, ntohs(icmp6->icmp6_seq), rtt);
+                           payload_size, src_str, sequence, rtt);
+                    
                     rtts[rtt_count++] = rtt;
                     packets_received++;
                     retry_count = 0;
                     ping_count--;
                     sequence++;
+                    
+                    // printf("Debug: Current state - Sent: %d, Received: %d, Remaining: %d\n",
+                    //        packets_sent, packets_received, ping_count);
                 }
-            } else {
+                // else {
+                //     printf("Debug: Skipping ICMPv6 packet - Type: %d, ID: %d (expected: %d), Seq: %d (expected: %d)\n",
+                //            icmp6->icmp6_type, 
+                //            ntohs(icmp6->icmp6_id),
+                //            expected_id,
+                //            ntohs(icmp6->icmp6_seq),
+                //            sequence);
+                // }
+            } 
+            else {
                 struct iphdr *ip_header = (struct iphdr *)packet_buffer;
                 struct icmphdr *icmp4 = (struct icmphdr *)(packet_buffer + ip_header->ihl * 4);
                 if (icmp4->type == ICMP_ECHOREPLY) {
