@@ -9,6 +9,17 @@
 #include <sys/time.h>
 #include <errno.h>
 #include <bits/getopt_core.h>
+/****
+ * Method Goal:
+ *  Calculate the checksum for ICMP packets to ensure data integrity
+ * Takes a buffer of data and its length
+    Performs a 16-bit one's complement sum over the buffer
+    Handles odd-length buffers
+    Folds the 32-bit sum into 16 bits
+* Return:
+    16-bit checksum value for the ICMP packet
+
+ */
 unsigned short calculate_checksum(void *b, int len) {
     unsigned short *buf = b;
     unsigned int sum = 0;
@@ -25,6 +36,19 @@ unsigned short calculate_checksum(void *b, int len) {
     result = ~sum;
     return result;
 }
+//--------------------------------------------------------------------------------------------
+
+/****
+ * Method Goal:
+ *  Create and send an ICMP Echo Request packet with specified TTL
+    Creates a 64-byte packet buffer
+    Fills ICMP header fields (type, code, ID, sequence)
+    Calculates and sets checksum
+    Sets TTL value for the socket
+    Sends packet to destination
+
+ */
+
 void send_icmp_packet(int sock, struct sockaddr_in *dest, int ttl) {
     char packet[64];
     struct icmphdr *icmp_hdr = (struct icmphdr *)packet;
@@ -49,6 +73,21 @@ void send_icmp_packet(int sock, struct sockaddr_in *dest, int ttl) {
         perror("sendto");
     }
 }
+//---------------------------------------------------------------------------------------------------
+/****
+ * Method Goal:
+ *  Receive and process ICMP responses
+    Waits for incoming ICMP packet
+    Handles timeout conditions
+    Calculates Round Trip Time (RTT)
+    Processes both TIME_EXCEEDED and ECHO_REPLY messages
+    Prints router IP address and RTT
+* Return:
+    1 if destination reached (ECHO_REPLY)
+    0 if intermediate hop (TIME_EXCEEDED)
+    -1 on timeout or error
+
+ */
 int receive_icmp_response(int sock, struct timeval *start_time) {
     char buffer[1024];
     struct sockaddr_in recv_addr;
@@ -83,6 +122,20 @@ int receive_icmp_response(int sock, struct timeval *start_time) {
 
     return 0;
 }
+//---------------------------------------------------------------------------------------------------
+/****
+ * Method Goal:
+ *  Implement main traceroute functionality
+
+    Sets up destination address structure
+    Creates separate sockets for sending and receiving
+    Sets socket timeout
+    Iterates through TTL values (1-30):
+        Sends ICMP packet with current TTL
+        Receives and processes response
+        Handles destination reached condition
+        Cleans up sockets
+ */
 void traceroute(const char *target) {
     int send_sock, recv_sock;
     struct sockaddr_in dest_addr;
@@ -129,6 +182,7 @@ void traceroute(const char *target) {
     close(send_sock);
     close(recv_sock);
 }
+
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
