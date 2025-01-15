@@ -8,6 +8,7 @@
 #include <netinet/ip.h>
 #include <sys/time.h>
 #include <errno.h>
+#include <bits/getopt_core.h>
 unsigned short calculate_checksum(void *b, int len) {
     unsigned short *buf = b;
     unsigned int sum = 0;
@@ -72,7 +73,12 @@ int receive_icmp_response(int sock, struct timeval *start_time) {
 
     if (icmp_hdr->type == ICMP_TIME_EXCEEDED || icmp_hdr->type == ICMP_ECHOREPLY) {
         printf("%s (RTT: %.2f ms)\n", inet_ntoa(recv_addr.sin_addr), rtt);
-        return (icmp_hdr->type == ICMP_ECHOREPLY) ? 1 : 0;
+        if (icmp_hdr->type == ICMP_ECHOREPLY) {
+            return 1;
+        } 
+        else {
+            return 0;
+        }
     }
 
     return 0;
@@ -125,11 +131,34 @@ void traceroute(const char *target) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <target>\n", argv[0]);
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s -a <address>\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
-    traceroute(argv[1]);
+    char *target_address = NULL;
+    int opt;
+
+    // Parse command-line options
+    while ((opt = getopt(argc, argv, "a:")) != -1) {
+        switch (opt) {
+            case 'a':
+                target_address = optarg;
+                break;
+            default:
+                fprintf(stderr, "Usage: %s -a <address>\n", argv[0]);
+                return 1;
+        }
+    }
+
+    // Validate that target_address is provided
+    if (target_address == NULL) {
+        fprintf(stderr, "Error: Target address must be specified with -a\n");
+        return 1;
+    }
+
+    // Call traceroute function with the provided address
+    traceroute(target_address);
     return 0;
 }
+
