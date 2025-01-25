@@ -125,6 +125,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Usage: %s -a <address> -t <type> [-c <count>] [-f]\n", argv[0]);
         return 1;
     }
+    
 
     int ping_count = MAX_REQUESTS;
     int flood_mode = 0;
@@ -161,8 +162,8 @@ int main(int argc, char *argv[]) {
                 return 1;
         }
     }
-    if (ip_v == 0) {
-        fprintf(stderr, "Error: Address and IP version are required.\n");
+    if (ip_v == 0||target_address==NULL) {
+        fprintf(stderr, "Usage: %s -a <address> -t <type> [-c <count>] [-f]\n", argv[0]);
         return 1;
     }
     //Validate inputs and check IPv6 availability if needed
@@ -262,7 +263,7 @@ int main(int argc, char *argv[]) {
     char *msg = "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890!@#$^&*()_+{}|:<>?~`-=[]',.  ";
     int payload_size = strlen(msg + 1);
     char packet_buffer[BUFFER_SIZE] = {0};
-    int retry_count = 0;
+    // int retry_count ;
     int sequence = 0;
 
     printf("PING %s with %d bytes of data:\n", target_address, payload_size);
@@ -348,21 +349,14 @@ int main(int argc, char *argv[]) {
                     
                     rtts[rtt_count++] = rtt;
                     packets_received++;
-                    retry_count = 0;
+                    // retry_count = 0;
                     ping_count--;
                     sequence++;
                     
                     // printf("Debug: Current state - Sent: %d, Received: %d, Remaining: %d\n",
                     //        packets_sent, packets_received, ping_count);
                 }
-                // else {
-                //     printf("Debug: Skipping ICMPv6 packet - Type: %d, ID: %d (expected: %d), Seq: %d (expected: %d)\n",
-                //            icmp6->icmp6_type, 
-                //            ntohs(icmp6->icmp6_id),
-                //            expected_id,
-                //            ntohs(icmp6->icmp6_seq),
-                //            sequence);
-                // }
+                
             } 
             else {
                 struct iphdr *ip_header = (struct iphdr *)packet_buffer;
@@ -373,7 +367,7 @@ int main(int argc, char *argv[]) {
                            ntohs(icmp4->un.echo.sequence), ip_header->ttl, rtt);
                     rtts[rtt_count++] = rtt;
                     packets_received++;
-                    retry_count = 0;
+                    // retry_count = 0;
                     ping_count--;
                     sequence++;
                 }
