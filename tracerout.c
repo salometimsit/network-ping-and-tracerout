@@ -18,14 +18,15 @@
 #define BUFFER_SIZE 1024
 
 /**
- * Method Goal: Calculate the checksum for ICMP packets
+ * Method Goal: 
+ *  Calculate the checksum for IP and ICMP packets
  * What the Method Does:
  * - Takes a buffer of data and its length
  * - Performs a 16-bit one's complement sum over the buffer
  * - Handles odd-length buffers
  * - Folds the 32-bit sum into 16 bits
  * Return:
- * - 16-bit checksum value for the ICMP packet
+ * - 16-bit checksum value for the packet
  */
 unsigned short calculate_checksum(void *b, int len) {
     unsigned short *buf = b;
@@ -45,42 +46,66 @@ unsigned short calculate_checksum(void *b, int len) {
 }
 
 /**
- * Method Goal: Create and send an ICMP Echo Request packet
+ * Method Goal: 
+ *  Create and send an ICMP Echo Request packet with custom IP header
  * What the Method Does:
  * - Creates a packet buffer of defined size
- * - Fills ICMP header fields (type, code, ID, sequence)
- * - Calculates and sets checksum
- * - Sets TTL value for the socket
+ * - Creates custom IP header
+ * - Fills ICMP header fields
+ * - Calculates and sets checksums for both headers
  * - Sends packet to destination
  * Return: void
  */
 void send_icmp_packet(int sock, struct sockaddr_in *dest, int ttl, int seq) {
-    char packet[PACKET_SIZE];
-    struct icmphdr *icmp_hdr = (struct icmphdr *)packet;
+    // Increase packet size to accommodate both IP and ICMP headers
+    char packet[PACKET_SIZE + sizeof(struct iphdr)];
+    struct iphdr *ip_hdr = (struct iphdr *)packet;
+    struct icmphdr *icmp_hdr = (struct icmphdr *)(packet + sizeof(struct iphdr));
 
+    // Clear the packet buffer
     memset(packet, 0, sizeof(packet));
 
-    // Fill ICMP Header
+    // Fill in the IP header
+    ip_hdr->version = 4;  // IPv4
+    ip_hdr->ihl = 5;      // 5 * 32-bit words = 20 bytes (standard IP header size)
+    ip_hdr->tos = 0;
+    ip_hdr->tot_len = sizeof(struct iphdr) + PACKET_SIZE;
+    ip_hdr->id = htons(getpid());
+    ip_hdr->frag_off = 0;
+    ip_hdr->ttl = ttl;
+    ip_hdr->protocol = IPPROTO_ICMP;
+    ip_hdr->check = 0;    // Will be filled by kernel
+    ip_hdr->saddr = INADDR_ANY;  // Source address
+    ip_hdr->daddr = dest->sin_addr.s_addr;  // Destination address
+    
+    // Calculate IP header checksum
+    ip_hdr->check = calculate_checksum(ip_hdr, sizeof(struct iphdr));
+
+    // Fill in the ICMP header
     icmp_hdr->type = ICMP_ECHO;
     icmp_hdr->code = 0;
     icmp_hdr->checksum = 0;
     icmp_hdr->un.echo.id = getpid();
     icmp_hdr->un.echo.sequence = seq;
 
-    // Calculate checksum
-    icmp_hdr->checksum = calculate_checksum(packet, sizeof(packet));
+    // Calculate ICMP checksum
+    icmp_hdr->checksum = calculate_checksum(icmp_hdr, PACKET_SIZE);
 
-    // Set the TTL
-    setsockopt(sock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
+    // Tell the kernel we'll provide the IP header
+    int one = 1;
+    if (setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
+        perror("setsockopt IP_HDRINCL");
+        return;
+    }
 
-    // Send the packet
-    if (sendto(sock, packet, sizeof(packet), 0, (struct sockaddr *)dest, sizeof(*dest)) < 0) {
+    if (sendto(sock, packet, ip_hdr->tot_len, 0, (struct sockaddr *)dest, sizeof(*dest)) < 0) {
         perror("sendto");
     }
 }
 
 /**
- * Method Goal: Receive and process ICMP responses
+ * Method Goal: 
+ *  Receive and process ICMP responses
  * What the Method Does:
  * - Waits for incoming ICMP packet
  * - Handles timeout conditions
@@ -126,7 +151,8 @@ int receive_icmp_response(int sock, struct timeval *start_time, double *rtt, cha
 }
 
 /**
- * Method Goal: Implement main traceroute functionality
+ * Method Goal:
+ *   Implement main traceroute functionality
  * What the Method Does:
  * - Sets up destination address structure
  * - Creates separate sockets for sending and receiving
@@ -151,11 +177,13 @@ void traceroute(const char *target) {
         exit(EXIT_FAILURE);
     }
 
-    send_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    // Use IPPROTO_RAW for custom IP header
+    send_sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (send_sock < 0) {
         perror("send socket");
         exit(EXIT_FAILURE);
     }
+
     recv_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (recv_sock < 0) {
         perror("recv socket");
@@ -202,7 +230,8 @@ void traceroute(const char *target) {
 }
 
 /**
- * Method Goal: Program entry point and argument processing
+ * Method Goal: 
+ *  Program entry point and argument processing
  * What the Method Does:
  * - Validates command line arguments
  * - Parses -a option for target address
@@ -219,8 +248,7 @@ int main(int argc, char *argv[]) {
 
     char *target_address = NULL;
     int opt;
-
-    // Parse command-line options
+  
     while ((opt = getopt(argc, argv, "a:")) != -1) {
         switch (opt) {
             case 'a':
@@ -231,8 +259,7 @@ int main(int argc, char *argv[]) {
                 return 1;
         }
     }
-
-    // Validate that target_address is provided
+ 
     if (target_address == NULL) {
         fprintf(stderr, "Error: Target address must be specified with -a\n");
         return 1;
